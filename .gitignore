@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+vector_db/*
+models/*
+*.pt
+*.bin
+*.gguf
+*.ipynb_checkpoints
+# ignore big data files
+data/videos/*
+models/*
+*.mp4
+*.mov
+*.bin
+*.pt
+*.safetensors
+
