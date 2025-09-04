@@ -1,6 +1,5 @@
-# app/engine/video_analyzer.py
 import cv2
-import numpy as np
+import os
 from typing import List, Dict
 
 def analyze_video_to_segments(
@@ -9,14 +8,12 @@ def analyze_video_to_segments(
     diff_threshold: float = 18.0,
 ) -> List[Dict]:
     """
-    極簡版「畫面變化」偵測：
-    - 每一幀取灰階 + 高斯模糊
-    - 計算相鄰幀的差異（平均絕對差）
-    - 累積分數，分到固定 window（預設 4 秒）裡
-    - 每個 window 輸出一個片段 {start, end, score}
-
-    回傳：List[{"start":float, "end":float, "score":float}]
+    以固定窗格（window_sec）做畫面差分打分，回傳多個區段：
+    [{"start": 0.0, "end": 4.0, "score": 12.3}, ...]
     """
+    if not os.path.exists(video_path):
+        return []
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return []
@@ -24,59 +21,49 @@ def analyze_video_to_segments(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     duration = total_frames / fps if fps > 0 else 0.0
-    if duration == 0:
+    if duration <= 0:
         cap.release()
         return []
 
-    window_frames = max(1, int(window_sec * fps))
-    prev = None
-    frame_idx = 0
-    window_score = 0.0
-    segments = []
-    window_start_sec = 0.0
+    step_frames = max(1, int(window_sec * fps))
+    prev_gray = None
+    scores = []
 
+    frame_idx = 0
     while True:
         ret, frame = cap.read()
         if not ret:
-            # 收尾：把最後一個 window 輸出
-            if frame_idx % window_frames != 0:
-                seg_end = duration
-                segments.append({
-                    "start": window_start_sec,
-                    "end": seg_end,
-                    "score": float(window_score),
-                })
             break
 
+        if prev_gray is None:
+            prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame_idx += 1
+            continue
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5,5), 0)
+        diff = cv2.absdiff(gray, prev_gray)
+        score = float(diff.mean())
+        scores.append(score)
 
-        if prev is not None:
-            diff = cv2.absdiff(gray, prev)
-            score = float(np.mean(diff))  # 畫面差異平均值
-            # 大於門檻就視為「精彩度」累加
-            if score > diff_threshold:
-                window_score += score
-
-        prev = gray
+        prev_gray = gray
         frame_idx += 1
 
-        # 到了一個 window，切出片段
-        if frame_idx % window_frames == 0:
-            seg_end = frame_idx / fps
-            segments.append({
-                "start": window_start_sec,
-                "end": seg_end,
-                "score": float(window_score),
-            })
-            window_start_sec = seg_end
-            window_score = 0.0
-
     cap.release()
-    # 過濾掉太短或異常的片段
-    cleaned = []
-    for s in segments:
-        dur = max(0.0, s["end"] - s["start"])
-        if dur >= 0.5:  # 半秒以下丟掉
-            cleaned.append(s)
-    return cleaned
+
+    # 聚合到每個窗格
+    segments: List[Dict] = []
+    # 以每窗的平均差分作為分數
+    for start_f in range(0, max(1, len(scores)), step_frames):
+        end_f = min(len(scores), start_f + step_frames)
+        if end_f <= start_f:
+            continue
+        seg_scores = scores[start_f:end_f]
+        avg = sum(seg_scores) / max(1, len(seg_scores))
+        start_t = start_f / fps
+        end_t = end_f / fps
+        segments.append({"start": start_t, "end": end_t, "score": avg})
+
+    # 簡單濾掉極低分
+    segments = [s for s in segments if s["score"] >= 0.0]  # 你也可用 diff_threshold
+
+    return segments

@@ -3,7 +3,18 @@ services:
     build: .
     ports:
       - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - CAPTION_PROVIDER=${CAPTION_PROVIDER:-local}
+      - CAPTION_BASE_MODEL=${CAPTION_BASE_MODEL:-sshleifer/tiny-gpt2}
+      - CAPTION_QUANT=${CAPTION_QUANT:-}
+      # OpenAI
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
     volumes:
       - ./vector_db:/app/vector_db
       - ./models:/app/models
       - ./data:/app/data
+      - ./hf_cache:/root/.cache/huggingface

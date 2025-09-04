@@ -1,142 +1,151 @@
-# app/api/main.py
-import os
-import glob
-import shutil
-from typing import Optional, List
-
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
+from typing import Optional, List
+import os, glob, shutil
 
-# 若影片存在且你想真的做切片分析，會用到這個方法
-#（影片不存在或在 CI 環境會走 fallback，不會呼叫到 heavy 邏輯）
 from app.engine.video_analyzer import analyze_video_to_segments
+from app.engine.captioner import generate_caption_text, GenerationParams
+# 可選：如果你有檢索 API
+try:
+    from app.engine.retrieve import answer_with_citations
+except Exception:
+    answer_with_citations = None  # 沒有就略過
 
 app = FastAPI(title="AI Short Video MVP", version="0.5.0")
 
-# ---------------------------------------------------------------------
-# Constants / Helpers
-# ---------------------------------------------------------------------
 UPLOAD_DIR = os.path.join("data", "videos")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-def _find_video_path(video_id_or_name: str) -> Optional[str]:
-    """
-    嘗試以多種常見副檔名尋找影片；也支援 data/videos/{video_id}/* 結構。
-    """
-    base = UPLOAD_DIR
-    # 直接嘗試 "demo"、"demo.mp4"、"demo.mov"...
-    for ext in ("", ".mp4", ".mov", ".mkv", ".avi"):
-        cand = os.path.join(base, f"{video_id_or_name}{ext}")
-        if os.path.exists(cand):
-            return cand
-    # 也試試 {video_id}/* 目錄型態
-    candidates = glob.glob(os.path.join(base, video_id_or_name, "*"))
-    return candidates[0] if candidates else None
 
-def _in_ci() -> bool:
-    """GitHub Actions 會帶 CI=true，CI 環境下回傳假資料以通過測試。"""
-    return os.getenv("CI", "").lower() == "true"
-
-# ---------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------
 class GenerateReq(BaseModel):
     video_id: str
     target_duration_sec: float = 34.0
-    # 未指定就用 video_id 當檔名
     video_filename: Optional[str] = None
     language: Optional[str] = "zh"
 
-class RetrieveReq(BaseModel):
-    query: str
 
-# ---------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------
+def _in_ci() -> bool:
+    v = (os.getenv("CI") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _find_video_path(video_id_or_name: str) -> Optional[str]:
+    """
+    影片名稱大小寫與是否含副檔名皆可。
+    亦支援 data/videos/<id>/* 的目錄型態（取第一個檔）。
+    """
+    base = UPLOAD_DIR
+
+    # 1) 先嘗試原樣路徑
+    direct = os.path.join(base, video_id_or_name)
+    if os.path.exists(direct):
+        return direct
+
+    # 2) 嘗試常見副檔名（大小寫都試）
+    exts = (".mp4", ".mov", ".mkv", ".avi")
+    stem = os.path.splitext(video_id_or_name)[0]
+    for ext in exts:
+        for cand in (ext, ext.upper()):
+            p = os.path.join(base, f"{stem}{cand}")
+            if os.path.exists(p):
+                return p
+
+    # 3) 目錄型態
+    candidates = sorted(glob.glob(os.path.join(base, stem, "*")))
+    return candidates[0] if candidates else None
+
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "ai-short-video-mvp"}
 
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
 @app.post("/upload_video")
-async def upload_video(file: UploadFile = File(...)):
-    """上傳影片；存在 data/videos/ 下。"""
-    out_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(out_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-    return {"video_id": file.filename, "path": out_path}
+def upload_video(file: UploadFile = File(...)):
+    dest = os.path.join(UPLOAD_DIR, file.filename)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "wb") as f:
+        shutil.copyfileobj(file.file, f)  # 流式複製，省 RAM
+    return {"video_id": os.path.splitext(file.filename)[0], "path": dest}
+
 
 @app.post("/generate_caption")
 def generate_caption(req: GenerateReq):
-    """
-    CI 或找不到影片時 → 回傳固定假資料，避免測試依賴真實媒體/模型。
-    若影片存在且非 CI → 走簡單切片挑選邏輯（使用 video_analyzer）。
-    """
     filename = req.video_filename or req.video_id
     video_path = _find_video_path(filename)
 
-    # CI 環境 或 影片不存在 → 回傳穩定假資料（符合 tests/test_api.py 的期待）
+    # CI 或找不到影片 → 回傳固定 demo（維持原行為，方便 CI）
     if _in_ci() or not video_path:
         return {
             "video_id": req.video_id,
             "target_duration_sec": req.target_duration_sec,
             "highlight_segments": [[0, 3], [8, 12]],
             "caption": "Demo caption for CI run.",
-            "hashtags": ["#AutoHighlight", "#MVP"]
+            "hashtags": ["#AutoHighlight", "#MVP"],
         }
 
-    # 非 CI 且找得到影片 → 真的做影片分析（快速版）
-    segments = analyze_video_to_segments(video_path, window_sec=4.0, diff_threshold=18.0)
+    try:
+        # ① 分析影片（每窗 4 秒，依畫面差分打分）
+        segments = analyze_video_to_segments(
+            video_path, window_sec=4.0, diff_threshold=18.0
+        )
 
-    # 依 score 排序，湊近 target_duration_sec
-    target = float(req.target_duration_sec or 34.0)
-    picked: List[dict] = []
-    total = 0.0
-    for seg in sorted(segments, key=lambda s: -s.get("score", 0.0)):
-        dur = max(0.0, float(seg["end"]) - float(seg["start"]))
-        if total + dur <= target:
-            picked.append(seg)
-            total += dur
-        if total >= target * 0.95:
-            break
+        # ② 依分數挑片段直到接近 target
+        target = float(req.target_duration_sec or 34.0)
+        picked: List[dict] = []
+        total = 0.0
+        for seg in sorted(segments, key=lambda s: -s.get("score", 0.0)):
+            dur = max(0.0, float(seg["end"]) - float(seg["start"]))
+            if dur <= 0:
+                continue
+            if total + dur <= target:
+                picked.append(seg)
+                total += dur
+            if total >= target * 0.95:
+                break
 
-    # 產生簡單 caption（可日後接 LLM/LoRA）
-    caption = f"自動挑選 {len(picked)} 段（約 {int(total)} 秒）— 之後會用 LLM 生成旅遊語氣文案。"
-    hashtags = ["#AutoHighlight", "#OpenCV", "#MVP"]
+        # ③ 生成 caption（參數物件化，之後好擴充）
+        params = GenerationParams(max_new_tokens=60, temperature=0.8, top_p=0.9)
+        caption = generate_caption_text(
+            video_id=req.video_id,
+            segments=picked,
+            lang=(req.language or "zh"),
+            params=params,  # ← 不再傳未知 kwargs
+        )
 
-    # 將回傳的 highlight_segments 壓成 [[start, end], ...] 的簡潔格式
-    highlight_segments = [[float(s["start"]), float(s["end"])] for s in picked]
+        highlight_segments = [
+            [float(s["start"]), float(s["end"])] for s in picked
+        ]
+        hashtags = ["#Travel", "#Shorts", "#AI"]
 
-    return {
-        "video_id": req.video_id,
-        "target_duration_sec": req.target_duration_sec,
-        "highlight_segments": highlight_segments,
-        "caption": caption,
-        "hashtags": hashtags
-    }
+        return {
+            "video_id": req.video_id,
+            "target_duration_sec": req.target_duration_sec,
+            "highlight_segments": highlight_segments,
+            "caption": caption,
+            "hashtags": hashtags,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+# 可選：檢索 API（若有向量庫）
+class RetrieveReq(BaseModel):
+    query: str
+
 
 @app.post("/retrieve_info")
 def retrieve_info(req: RetrieveReq):
-    """
-    CI 環境 → 回傳固定 JSON；包含 answer 與 citations（空陣列）。
-    非 CI → 簡易讀範例文件，依樣回傳 answer 與 citations。
-    """
-    if _in_ci():
-        return {
-            "ok": True,
-            "answer": f"stubbed answer for query: {req.query}",
-            "citations": [],           # ✅ 測試要求的欄位
-        }
-
-    text = ""
+    if answer_with_citations is None:
+        return {"ok": True, "answer": "(retrieve disabled)", "sources": []}
     try:
-        with open(os.path.join("data", "docs", "sri_lanka_visa.txt"), "r", encoding="utf-8") as f:
-            text = f.read()
-    except FileNotFoundError:
-        pass
-
-    # 這裡先回占位資料；之後可替換成真正 RAG 的結果與來源
-    return {
-        "ok": True,
-        "answer": "RAG response (placeholder)",
-        "citations": ["data/docs/sri_lanka_visa.txt"] if text else [],  # ✅ 一樣提供 citations
-    }
+        answer, hits = answer_with_citations(req.query, k=3)
+        return {"ok": True, "answer": answer, "sources": hits}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")

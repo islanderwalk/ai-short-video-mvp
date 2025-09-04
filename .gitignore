@@ -1,17 +1,52 @@
+# -----------------------------
+# Python / Virtual Env
+# -----------------------------
 .venv/
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.ipynb_checkpoints
+
+# -----------------------------
+# FastAPI / Vector DB
+# -----------------------------
 vector_db/*
-models/*
+
+# -----------------------------
+# Data
+# -----------------------------
+# 忽略影片（太大）
+data/videos/*
+*.mp4
+*.mov
+
+# 保留 RAG 文件（data/docs/） -> 不要忽略
+
+# -----------------------------
+# Models
+# -----------------------------
+# 忽略常見大檔模型權重，但保留 config.json / tokenizer.json
 *.pt
 *.bin
 *.gguf
-*.ipynb_checkpoints
-# ignore big data files
-data/videos/*
-models/*
-*.mp4
-*.mov
-*.bin
-*.pt
 *.safetensors
 
+# 如果需要，可以保留模型結構
+# e.g. models/lora/config.json 會被保留，adapter權重不會被提交
+# 整個 models/ 資料夾不忽略，方便放小檔或readme
+
+# -----------------------------
+# Env / Secrets
+# -----------------------------
+.env
+*.env
+.env.*
+!.env.example
+
+# -----------------------------
+# Docker / Misc
+# -----------------------------
+*.log
+*.tmp
+*.DS_Store
